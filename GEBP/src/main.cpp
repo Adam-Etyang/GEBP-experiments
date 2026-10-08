@@ -9,16 +9,28 @@
 
 int main(int argc, char *argv[]) {
   int size = 512;
+  std::string order = "kij";
+  if (argc > 3) {
+    std::cerr << "usage: gebp [positive-matrix-size] [ijk|ikj|kij]\n";
+    return 1;
+  }
   if (argc > 1) {
     try {
       size = std::stoi(argv[1]);
     } catch (const std::exception &) {
-      std::cerr << "usage: gebp [positive-matrix-size]\n";
+      std::cerr << "usage: gebp [positive-matrix-size] [ijk|ikj|kij]\n";
       return 1;
     }
   }
+  if (argc > 2) {
+    order = argv[2];
+  }
   if (size <= 0) {
     std::cerr << "matrix size must be positive\n";
+    return 1;
+  }
+  if (order != "ijk" && order != "ikj" && order != "kij") {
+    std::cerr << "loop ordering must be ijk, ikj, or kij\n";
     return 1;
   }
 
@@ -41,13 +53,41 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  const auto start = std::chrono::steady_clock::now();
-  for (int i = 0; i < A.rows; i++) {
-    for (int j = 0; j < B.cols; j++) {
-      for (int k = 0; k < A.cols; k++) {
-        C(i, j) += A(i, k) * B(k, j);
+  const auto multiply_ijk = [&] {
+    for (int i = 0; i < A.rows; i++) {
+      for (int j = 0; j < B.cols; j++) {
+        for (int k = 0; k < A.cols; k++) {
+          C(i, j) += A(i, k) * B(k, j);
+        }
       }
     }
+  };
+  const auto multiply_ikj = [&] {
+    for (int i = 0; i < A.rows; i++) {
+      for (int k = 0; k < A.cols; k++) {
+        for (int j = 0; j < B.cols; j++) {
+          C(i, j) += A(i, k) * B(k, j);
+        }
+      }
+    }
+  };
+  const auto multiply_kij = [&] {
+    for (int k = 0; k < A.cols; k++) {
+      for (int i = 0; i < A.rows; i++) {
+        for (int j = 0; j < B.cols; j++) {
+          C(i, j) += A(i, k) * B(k, j);
+        }
+      }
+    }
+  };
+
+  const auto start = std::chrono::steady_clock::now();
+  if (order == "ijk") {
+    multiply_ijk();
+  } else if (order == "ikj") {
+    multiply_ikj();
+  } else {
+    multiply_kij();
   }
   const auto end = std::chrono::steady_clock::now();
 
@@ -58,6 +98,7 @@ int main(int argc, char *argv[]) {
 
   const std::chrono::duration<double, std::milli> elapsed = end - start;
   std::cout << "Matrix size: " << size << " x " << size << '\n'
+            << "Loop order: " << order << '\n'
             << "GEMM time: " << elapsed.count() << " ms\n"
             << "Checksum: " << checksum << '\n';
 
