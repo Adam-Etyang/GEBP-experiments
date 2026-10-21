@@ -10,22 +10,23 @@ cmake --build build
 ./build/gebp
 ```
 
-The program compares an allocating matrix-chain implementation with the
-buffer-reuse implementation. Both multiply the same chain of three
-deterministic square matrices, 512 × 512 by default. Pass a positive integer to
-choose another size:
+The program benchmarks three implementations on the same chain of three
+deterministic square matrices, 512 × 512 by default: allocating C++, buffer
+reuse in C++, and buffer reuse with ARM NEON. Pass a positive integer to choose
+another size:
 
 ```sh
 ./build/gebp 256
 ```
 
-Both implementations use the same blocked `i-k-j` GEMM kernel with a 32-element
-block size. The allocating version creates a new result for each pairwise
-product; the buffer-reuse version alternates two output buffers through
-`matmul_into_blocked`. Inputs are copied before timing, and the program checks
-the blocked kernel against the unblocked kernel as well as comparing the two
-chain results. Timings are medians of five Release-build runs. A three-matrix
-chain performs approximately `4N³` floating-point operations.
+Current C++ and NEON kernels use a 4×2 register microtile inside 32×32 cache
+tiles. The allocating C++ chain creates a new result for each pairwise product;
+the buffer-reuse variants alternate two output buffers. Inputs are copied
+before timing, and the program checks the register-blocked kernels against the
+unblocked reference. Timings are medians of five Release-build runs. A
+three-matrix chain performs approximately `4N³` floating-point operations.
+
+### Earlier loop-order and cache-blocking measurements (retained)
 
 Each pair below is `allocating / buffer reuse` time in milliseconds. The
 blocked-loop columns name the order of the outer tile loops:
@@ -46,7 +47,10 @@ sizes in these runs. Results match for all measured sizes, including a 37 × 37
 check for partial edge tiles. These are separate five-run medians, so small
 differences can vary with system load.
 
-## ARM NEON comparison
+## ARM NEON comparison: pre-register-blocking sample
+
+These earlier Release medians are retained for reference. The fresh `-O3`
+results from the optimization-level comparison below are more recent.
 
 On this ARM64 machine with Apple Clang 21, the compiler already vectorizes the
 inner `j` loop in the blocked C++ kernel (vector width 2, interleave count 4).
@@ -65,3 +69,46 @@ inputs, and three-matrix chain. Times are five-run medians; speedup is
 Checksums agreed at all sizes. In this implementation the explicit NEON path
 did not outperform the compiler-vectorized loop, so the compiler-generated
 SIMD remains faster in these measurements.
+
+## `-O0` vs `-O3`: pre-register-blocking sample
+
+The CMake Release build already uses `-O3 -DNDEBUG`. For comparison, both
+implementations were also compiled at `-O0` with Apple Clang 21 for ARM64 and
+benchmarked on the same three-matrix workload. Values are five-run medians;
+speedup is `O0 time / O3 time`.
+
+| Matrix size | Blocked C++ `-O0` (ms) | Blocked C++ `-O3` (ms) | Speedup |
+| ----------: | ---------------------: | ---------------------: | ------: |
+|     64 × 64 |                 4.3758 |                 0.1995 | 21.9× |
+|   128 × 128 |                24.9330 |                 0.9874 | 25.2× |
+|   256 × 256 |               184.2527 |                 5.3378 | 34.5× |
+
+| Matrix size | NEON `-O0` (ms) | NEON `-O3` (ms) | Speedup |
+| ----------: | --------------: | --------------: | ------: |
+|     64 × 64 |          2.2278 |          0.3229 | 6.9× |
+|   128 × 128 |         14.5078 |          1.1125 | 13.0× |
+|   256 × 256 |        107.0268 |          6.5508 | 16.3× |
+
+Optimization substantially speeds up both paths. At `-O0`, explicit NEON is
+about 1.7–2.0× faster than the blocked C++ loop; at `-O3`, the compiler's
+auto-vectorized C++ loop is faster than this NEON implementation on the tested
+sizes.
+
+## Register-blocked kernel comparison
+
+Both current kernels use a 4×2 output microtile inside the 32×32 cache tiles.
+The C++ kernel keeps eight scalar accumulators; the NEON kernel keeps four
+two-double vector accumulators across the `k` loop. These are medians of five
+Release-build runs on the same three-matrix chain, using buffer reuse for both
+kernels:
+
+| Matrix size | Register-blocked C++ (ms) | Register-blocked NEON (ms) | NEON speedup |
+| ----------: | ------------------------: | -------------------------: | -----------: |
+|     64 × 64 |                    0.0801 |                     0.0608 | 1.32× |
+|   128 × 128 |                    0.9228 |                     0.5522 | 1.67× |
+|   256 × 256 |                    4.4444 |                     4.2341 | 1.05× |
+|   512 × 512 |                   38.3837 |                    36.8435 | 1.04× |
+| 1024 × 1024 |                  369.6558 |                   317.9738 | 1.16× |
+
+The outputs matched the unblocked reference, including a 37×37 case that
+exercises partial microtiles.

@@ -54,20 +54,66 @@ void matmul_into_blocked(const Matrix &A, const Matrix &B, Matrix &C,
   }
 
   std::fill(C.data.begin(), C.data.end(), 0.0);
+  constexpr int micro_rows = 4;
+  constexpr int micro_cols = 2;
   for (int ii = 0; ii < A.rows; ii += block_size) {
     const int i_end = std::min(ii + block_size, A.rows);
-
     for (int jj = 0; jj < B.cols; jj += block_size) {
       const int j_end = std::min(jj + block_size, B.cols);
 
-      for (int kk = 0; kk < A.cols; kk += block_size) {
-        const int k_end = std::min(kk + block_size, A.cols);
+      for (int i0 = ii; i0 < i_end; i0 += micro_rows) {
+        const int rows = std::min(micro_rows, i_end - i0);
+        for (int j0 = jj; j0 < j_end; j0 += micro_cols) {
+          const int cols = std::min(micro_cols, j_end - j0);
 
-        for (int i = ii; i < i_end; i++) {
-          for (int k = kk; k < k_end; k++) {
-            const double a_ik = A(i, k);
-            for (int j = jj; j < j_end; j++) {
-              C(i, j) += a_ik * B(k, j);
+          if (rows == micro_rows && cols == micro_cols) {
+            double c00 = 0.0, c01 = 0.0;
+            double c10 = 0.0, c11 = 0.0;
+            double c20 = 0.0, c21 = 0.0;
+            double c30 = 0.0, c31 = 0.0;
+
+            for (int kk = 0; kk < A.cols; kk += block_size) {
+              const int k_end = std::min(kk + block_size, A.cols);
+              for (int k = kk; k < k_end; k++) {
+                const double b0 = B(k, j0);
+                const double b1 = B(k, j0 + 1);
+                const double a0 = A(i0, k);
+                const double a1 = A(i0 + 1, k);
+                const double a2 = A(i0 + 2, k);
+                const double a3 = A(i0 + 3, k);
+                c00 += a0 * b0;
+                c01 += a0 * b1;
+                c10 += a1 * b0;
+                c11 += a1 * b1;
+                c20 += a2 * b0;
+                c21 += a2 * b1;
+                c30 += a3 * b0;
+                c31 += a3 * b1;
+              }
+            }
+
+            C(i0, j0) = c00;
+            C(i0, j0 + 1) = c01;
+            C(i0 + 1, j0) = c10;
+            C(i0 + 1, j0 + 1) = c11;
+            C(i0 + 2, j0) = c20;
+            C(i0 + 2, j0 + 1) = c21;
+            C(i0 + 3, j0) = c30;
+            C(i0 + 3, j0 + 1) = c31;
+          } else {
+            double accum[micro_rows][micro_cols] = {};
+            for (int k = 0; k < A.cols; k++) {
+              for (int r = 0; r < rows; r++) {
+                const double a_ik = A(i0 + r, k);
+                for (int c = 0; c < cols; c++) {
+                  accum[r][c] += a_ik * B(k, j0 + c);
+                }
+              }
+            }
+            for (int r = 0; r < rows; r++) {
+              for (int c = 0; c < cols; c++) {
+                C(i0 + r, j0 + c) = accum[r][c];
+              }
             }
           }
         }
@@ -93,29 +139,58 @@ void matmul_into_neon(const Matrix &A, const Matrix &B, Matrix &C,
   }
 
   std::fill(C.data.begin(), C.data.end(), 0.0);
+  constexpr int micro_rows = 4;
+  constexpr int micro_cols = 2;
   for (int ii = 0; ii < A.rows; ii += block_size) {
     const int i_end = std::min(ii + block_size, A.rows);
     for (int jj = 0; jj < B.cols; jj += block_size) {
       const int j_end = std::min(jj + block_size, B.cols);
-      for (int kk = 0; kk < A.cols; kk += block_size) {
-        const int k_end = std::min(kk + block_size, A.cols);
-        for (int i = ii; i < i_end; i++) {
-          double *c_row = C.data.data() + static_cast<std::size_t>(i) * C.cols;
-          for (int k = kk; k < k_end; k++) {
-            const double a_ik = A(i, k);
-            const float64x2_t a_vec = vdupq_n_f64(a_ik);
-            const double *b_row =
-                B.data.data() + static_cast<std::size_t>(k) * B.cols;
+      for (int i0 = ii; i0 < i_end; i0 += micro_rows) {
+        const int rows = std::min(micro_rows, i_end - i0);
+        for (int j0 = jj; j0 < j_end; j0 += micro_cols) {
+          const int cols = std::min(micro_cols, j_end - j0);
 
-            int j = jj;
-            for (; j + 1 < j_end; j += 2) {
-              const float64x2_t b_vec = vld1q_f64(b_row + j);
-              float64x2_t c_vec = vld1q_f64(c_row + j);
-              c_vec = vfmaq_f64(c_vec, a_vec, b_vec);
-              vst1q_f64(c_row + j, c_vec);
+          if (rows == micro_rows && cols == micro_cols) {
+            float64x2_t c0 = vdupq_n_f64(0.0);
+            float64x2_t c1 = vdupq_n_f64(0.0);
+            float64x2_t c2 = vdupq_n_f64(0.0);
+            float64x2_t c3 = vdupq_n_f64(0.0);
+
+            for (int kk = 0; kk < A.cols; kk += block_size) {
+              const int k_end = std::min(kk + block_size, A.cols);
+              for (int k = kk; k < k_end; k++) {
+                const double *b_row =
+                    B.data.data() + static_cast<std::size_t>(k) * B.cols + j0;
+                const float64x2_t b_vec = vld1q_f64(b_row);
+                c0 = vfmaq_f64(c0, vdupq_n_f64(A(i0, k)), b_vec);
+                c1 = vfmaq_f64(c1, vdupq_n_f64(A(i0 + 1, k)), b_vec);
+                c2 = vfmaq_f64(c2, vdupq_n_f64(A(i0 + 2, k)), b_vec);
+                c3 = vfmaq_f64(c3, vdupq_n_f64(A(i0 + 3, k)), b_vec);
+              }
             }
-            for (; j < j_end; j++) {
-              c_row[j] += a_ik * b_row[j];
+
+            for (int r = 0; r < micro_rows; r++) {
+              double *c_row =
+                  C.data.data() + static_cast<std::size_t>(i0 + r) * C.cols + j0;
+              const float64x2_t c_vec = r == 0 ? c0 : r == 1 ? c1 : r == 2 ? c2 : c3;
+              vst1q_f64(c_row, c_vec);
+            }
+          } else {
+            double accum[micro_rows][micro_cols] = {};
+            for (int k = 0; k < A.cols; k++) {
+              for (int r = 0; r < rows; r++) {
+                const double a_ik = A(i0 + r, k);
+                for (int c = 0; c < cols; c++) {
+                  accum[r][c] += a_ik * B(k, j0 + c);
+                }
+              }
+            }
+            for (int r = 0; r < rows; r++) {
+              double *c_row =
+                  C.data.data() + static_cast<std::size_t>(i0 + r) * C.cols + j0;
+              for (int c = 0; c < cols; c++) {
+                c_row[c] = accum[r][c];
+              }
             }
           }
         }
@@ -374,11 +449,11 @@ int main(int argc, char *argv[]) {
             << "Three-matrix chain: " << size << " x " << size << '\n'
             << "Allocating median: " << allocating_ms << " ms ("
             << operations / (allocating_ms * 1.0e6) << " GFLOP/s)\n"
-            << "Blocked buffer-reuse median: " << reuse_ms << " ms ("
+            << "Register-blocked C++ median: " << reuse_ms << " ms ("
             << operations / (reuse_ms * 1.0e6) << " GFLOP/s)\n"
-            << "NEON buffer-reuse median: " << neon_ms << " ms ("
+            << "Register-blocked NEON median: " << neon_ms << " ms ("
             << operations / (neon_ms * 1.0e6) << " GFLOP/s)\n"
-            << "NEON speedup over blocked: " << reuse_ms / neon_ms << "x\n"
+            << "NEON speedup over C++: " << reuse_ms / neon_ms << "x\n"
             << "Results match: "
             << (allocating_checksum == reuse_checksum &&
                         max_relative_error <= 1.0e-10
