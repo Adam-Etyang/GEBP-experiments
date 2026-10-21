@@ -45,3 +45,23 @@ within about 1% of each other. The unblocked results remain faster at larger
 sizes in these runs. Results match for all measured sizes, including a 37 × 37
 check for partial edge tiles. These are separate five-run medians, so small
 differences can vary with system load.
+
+## ARM NEON comparison
+
+On this ARM64 machine with Apple Clang 21, the compiler already vectorizes the
+inner `j` loop in the blocked C++ kernel (vector width 2, interleave count 4).
+The manual NEON path was benchmarked with the same block size, buffer reuse,
+inputs, and three-matrix chain. Times are five-run medians; speedup is
+`compiler-vectorized time / NEON time`.
+
+| Matrix size | Compiler-vectorized (ms) | NEON (ms) | NEON speedup |
+| ----------: | -----------------------: | --------: | -----------: |
+|     64 × 64 |                   0.1403 |    0.1783 |        0.79× |
+|   128 × 128 |                   0.9133 |    1.0298 |        0.89× |
+|   256 × 256 |                   5.3979 |    6.5561 |        0.82× |
+|   512 × 512 |                  55.2239 |   57.2021 |        0.97× |
+| 1024 × 1024 |                 473.2603 |  517.7211 |        0.91× |
+
+Checksums agreed at all sizes. In this implementation the explicit NEON path
+did not outperform the compiler-vectorized loop, so the compiler-generated
+SIMD remains faster in these measurements.

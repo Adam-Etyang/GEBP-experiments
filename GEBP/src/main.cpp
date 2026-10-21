@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <exception>
 #include <iomanip>
@@ -9,6 +10,10 @@
 #include <vector>
 
 #include "matrix.h"
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 std::vector<std::pair<int, int>> block_ranges(int total, int n) {
   std::vector<std::pair<int, int>> ranges;
@@ -71,6 +76,57 @@ void matmul_into_blocked(const Matrix &A, const Matrix &B, Matrix &C,
   }
 }
 
+void matmul_into_neon(const Matrix &A, const Matrix &B, Matrix &C,
+                      int block_size = 32) {
+  if (block_size <= 0) {
+    throw std::invalid_argument("block size must be positive");
+  }
+  if (A.cols != B.rows || C.rows != A.rows || C.cols != B.cols) {
+    throw std::invalid_argument("matrix dimensions do not match for GEMM");
+  }
+
+#if defined(__aarch64__)
+  if (A.layout != Major::row_major || B.layout != Major::row_major ||
+      C.layout != Major::row_major) {
+    matmul_into_blocked(A, B, C, block_size);
+    return;
+  }
+
+  std::fill(C.data.begin(), C.data.end(), 0.0);
+  for (int ii = 0; ii < A.rows; ii += block_size) {
+    const int i_end = std::min(ii + block_size, A.rows);
+    for (int jj = 0; jj < B.cols; jj += block_size) {
+      const int j_end = std::min(jj + block_size, B.cols);
+      for (int kk = 0; kk < A.cols; kk += block_size) {
+        const int k_end = std::min(kk + block_size, A.cols);
+        for (int i = ii; i < i_end; i++) {
+          double *c_row = C.data.data() + static_cast<std::size_t>(i) * C.cols;
+          for (int k = kk; k < k_end; k++) {
+            const double a_ik = A(i, k);
+            const float64x2_t a_vec = vdupq_n_f64(a_ik);
+            const double *b_row =
+                B.data.data() + static_cast<std::size_t>(k) * B.cols;
+
+            int j = jj;
+            for (; j + 1 < j_end; j += 2) {
+              const float64x2_t b_vec = vld1q_f64(b_row + j);
+              float64x2_t c_vec = vld1q_f64(c_row + j);
+              c_vec = vfmaq_f64(c_vec, a_vec, b_vec);
+              vst1q_f64(c_row + j, c_vec);
+            }
+            for (; j < j_end; j++) {
+              c_row[j] += a_ik * b_row[j];
+            }
+          }
+        }
+      }
+    }
+  }
+#else
+  matmul_into_blocked(A, B, C, block_size);
+#endif
+}
+
 Matrix matmul(const Matrix &A, const Matrix &B) {
   if (A.cols != B.rows) {
     throw std::invalid_argument("matrix dimensions do not match for GEMM");
@@ -84,13 +140,18 @@ Matrix matmul(const Matrix &A, const Matrix &B) {
   return result;
 }
 
-Matrix matmul(std::vector<Matrix> mats) {
+template <typename Kernel>
+Matrix matmul_reusing(std::vector<Matrix> mats, Kernel kernel) {
   if (mats.size() < 2) {
     throw std::invalid_argument("Need at least 2 matrices");
   }
 
   if (mats.size() == 2) {
-    return matmul(mats[0], mats[1]);
+    Matrix result{mats[0].rows, mats[1].cols, Major::row_major,
+                  std::vector<double>(
+                      static_cast<std::size_t>(mats[0].rows) * mats[1].cols)};
+    kernel(mats[0], mats[1], result);
+    return result;
   }
 
   int result_cols = mats.front().cols;
@@ -115,10 +176,24 @@ Matrix matmul(std::vector<Matrix> mats) {
     scratch.cols = mats[i].cols;
     scratch.layout = Major::row_major;
     scratch.data.resize(static_cast<std::size_t>(scratch.rows) * scratch.cols);
-    matmul_into_blocked(result, mats[i], scratch);
+    kernel(result, mats[i], scratch);
     std::swap(result, scratch);
   }
   return result;
+}
+
+Matrix matmul(std::vector<Matrix> mats) {
+  return matmul_reusing(
+      std::move(mats), [](const Matrix &A, const Matrix &B, Matrix &C) {
+        matmul_into_blocked(A, B, C);
+      });
+}
+
+Matrix matmul_neon(std::vector<Matrix> mats) {
+  return matmul_reusing(
+      std::move(mats), [](const Matrix &A, const Matrix &B, Matrix &C) {
+        matmul_into_neon(A, B, C);
+      });
 }
 
 Matrix matmul_allocating(std::vector<Matrix> mats) {
@@ -204,12 +279,26 @@ int main(int argc, char *argv[]) {
     std::cerr << "buffer-reuse result differs from allocating result\n";
     return 1;
   }
+  const Matrix neon_check = matmul_neon(matrices);
+  double max_relative_error = 0.0;
+  for (std::size_t i = 0; i < reuse_check.data.size(); i++) {
+    const double scale = std::max(1.0, std::abs(reuse_check.data[i]));
+    max_relative_error =
+        std::max(max_relative_error,
+                 std::abs(neon_check.data[i] - reuse_check.data[i]) / scale);
+  }
+  if (max_relative_error > 1.0e-10) {
+    std::cerr << "NEON result differs from blocked result\n";
+    return 1;
+  }
 
   constexpr int repetitions = 5;
   std::vector<double> allocating_times;
   std::vector<double> reuse_times;
+  std::vector<double> neon_times;
   allocating_times.reserve(repetitions);
   reuse_times.reserve(repetitions);
+  neon_times.reserve(repetitions);
 
   auto measure_allocating = [&] {
     auto inputs = matrices;
@@ -229,40 +318,75 @@ int main(int argc, char *argv[]) {
         std::chrono::duration<double, std::milli>(end - start).count(),
         checksum(result)};
   };
+  auto measure_neon = [&] {
+    auto inputs = matrices;
+    const auto start = std::chrono::steady_clock::now();
+    const Matrix result = matmul_neon(std::move(inputs));
+    const auto end = std::chrono::steady_clock::now();
+    return std::pair{
+        std::chrono::duration<double, std::milli>(end - start).count(),
+        checksum(result)};
+  };
 
   double allocating_checksum = 0.0;
   double reuse_checksum = 0.0;
+  double neon_checksum = 0.0;
+  auto record_allocating = [&] {
+    const auto [elapsed, sum] = measure_allocating();
+    allocating_times.push_back(elapsed);
+    allocating_checksum = sum;
+  };
+  auto record_reuse = [&] {
+    const auto [elapsed, sum] = measure_reuse();
+    reuse_times.push_back(elapsed);
+    reuse_checksum = sum;
+  };
+  auto record_neon = [&] {
+    const auto [elapsed, sum] = measure_neon();
+    neon_times.push_back(elapsed);
+    neon_checksum = sum;
+  };
   for (int repetition = 0; repetition < repetitions; repetition++) {
-    if (repetition % 2 == 0) {
-      const auto [elapsed, sum] = measure_allocating();
-      allocating_times.push_back(elapsed);
-      allocating_checksum = sum;
-      const auto [reuse_elapsed, reuse_sum] = measure_reuse();
-      reuse_times.push_back(reuse_elapsed);
-      reuse_checksum = reuse_sum;
-    } else {
-      const auto [elapsed, sum] = measure_reuse();
-      reuse_times.push_back(elapsed);
-      reuse_checksum = sum;
-      const auto [allocating_elapsed, allocating_sum] = measure_allocating();
-      allocating_times.push_back(allocating_elapsed);
-      allocating_checksum = allocating_sum;
+    switch (repetition % 3) {
+    case 0:
+      record_allocating();
+      record_reuse();
+      record_neon();
+      break;
+    case 1:
+      record_reuse();
+      record_neon();
+      record_allocating();
+      break;
+    default:
+      record_neon();
+      record_allocating();
+      record_reuse();
+      break;
     }
   }
 
   const double allocating_ms = median(allocating_times);
   const double reuse_ms = median(reuse_times);
+  const double neon_ms = median(neon_times);
   const double operations = 4.0 * size * size * size;
   std::cout << std::fixed << std::setprecision(4)
             << "Three-matrix chain: " << size << " x " << size << '\n'
             << "Allocating median: " << allocating_ms << " ms ("
             << operations / (allocating_ms * 1.0e6) << " GFLOP/s)\n"
-            << "Buffer-reuse median: " << reuse_ms << " ms ("
+            << "Blocked buffer-reuse median: " << reuse_ms << " ms ("
             << operations / (reuse_ms * 1.0e6) << " GFLOP/s)\n"
-            << "Speedup: " << allocating_ms / reuse_ms << "x\n"
+            << "NEON buffer-reuse median: " << neon_ms << " ms ("
+            << operations / (neon_ms * 1.0e6) << " GFLOP/s)\n"
+            << "NEON speedup over blocked: " << reuse_ms / neon_ms << "x\n"
             << "Results match: "
-            << (allocating_checksum == reuse_checksum ? "yes" : "no")
-            << ", checksum " << reuse_checksum << '\n';
+            << (allocating_checksum == reuse_checksum &&
+                        max_relative_error <= 1.0e-10
+                    ? "yes"
+                    : "no")
+            << ", max relative error " << std::scientific << std::setprecision(3)
+            << max_relative_error << ", checksum " << std::fixed
+            << std::setprecision(4) << neon_checksum << '\n';
 
   return 0;
 }
